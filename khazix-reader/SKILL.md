@@ -1,0 +1,223 @@
+# 卡兹克公众号阅读器
+
+Base directory for this skill: ~/.claude/skills/khazix-reader
+
+在 Claude Code 里直接查阅「数字生命卡兹克」微信公众号文章，无需打开手机或浏览器。
+
+## 必需工具
+
+- Playwright MCP（`mcp__plugin_playwright_playwright__*`）：访问网页
+- Read / Write 工具：读写本地文件
+- 本地索引：`~/.claude/skills/khazix-reader/index.yaml`
+- 本地缓存目录：`~/.claude/skills/khazix-reader/cache/`（文章全文缓存，文件名为文章 mid 值，如 `2647682046.md`）
+
+---
+
+## 速度策略（优先级从高到低）
+
+```
+有缓存？ → 直接读本地文件，0 秒，跳过所有网络请求
+     ↓ 无
+本地索引命中？ → 展示标题列表，0 秒
+     ↓
+搜狗搜索兜底 → 展示标题+摘要，用户确认再加载全文
+```
+
+**原则：能不动 Playwright 就不动，能不加载全文就不加载。**
+
+---
+
+## 入口判断
+
+**每次被触发，先 Read 读取 `index.yaml`，再按下表路由：**
+
+```
+用户说了什么？
+├── 粘贴了 mp.weixin.qq.com 链接
+│   └── → 检查缓存 → 有则直接输出；无则进入 [流程 3：读取全文]
+│
+├── 说"刷新" / "更新索引"
+│   └── → 进入 [流程 4：刷新索引]
+│
+├── 说出专辑名（如"Claude Code攻略"、"Skills攻略"、"那些思想"…）
+│   └── → 进入 [流程 1：浏览专辑]
+│
+└── 说出关键词 / 主题（如"Claude Code设置"、"MCP"、"prompt技巧"）
+    ├── 在 index.yaml 所有文章标题中做本地模糊匹配
+    │   ├── 有命中 → 展示标题列表，用户选择后检查缓存 → [流程 3]
+    │   └── 无命中 → 进入 [流程 2：搜狗搜索]
+    └── 用户选择后检查缓存 → [流程 3]
+```
+
+index.yaml 包含 8 个专辑共 91 篇文章，本地匹配无需任何网络请求。
+
+---
+
+## 流程 1：浏览专辑
+
+**触发**：用户说出专辑名，或要求"看看 XX 专辑的文章"。
+
+**步骤**：
+
+1. 从 `index.yaml` 找到对应专辑，直接读取其 `articles` 列表（无需网络）
+2. 展示文章列表（标题旁标注是否有本地缓存 `[已缓存]`）：
+
+```
+📂 Claude Code攻略（共 7 篇）
+
+1. 从0开始，在国内用上Claude Code的终极保姆教程来了。[已缓存]
+2. 这个51K星标的开源神器，让任何Agent都能一键切换所有模型。
+3. 分享10个你可能不知道的Claude Code隐藏命令。
+...
+
+输入编号阅读，输入 0 退出
+```
+
+3. 用户输入编号后 → 检查缓存 → 进入 [流程 3：读取全文]
+
+**可用专辑名**（支持模糊匹配）：
+
+| 专辑 | 文章数 |
+|------|--------|
+| Claude Code攻略 | 7 |
+| Skills攻略 | 8 |
+| Prompt分享 | 5 |
+| Codex | 2 |
+| 科普解读 | 10 |
+| 那些思想 | 20 |
+| 那些人们 | 19 |
+| 产品推荐 | 20 |
+
+---
+
+## 流程 2：搜狗搜索（本地未命中时的兜底）
+
+**触发**：关键词在本地 index.yaml 中找不到匹配标题。
+
+**步骤**：
+
+1. 构建搜索 URL 并用 `browser_navigate` 打开：
+   ```
+   https://weixin.sogou.com/weixin?type=2&query=数字生命卡兹克+{关键词}&ie=utf8
+   ```
+
+2. 用 `browser_snapshot` 获取页面，筛选来源为「数字生命卡兹克」的条目，提取标题、日期、摘要、Sogou 跳转链接
+
+3. **先展示标题 + 摘要**，询问用户要看哪篇全文：
+
+```
+🔍 搜索「{关键词}」，找到 N 篇：
+
+1. [标题] — YYYY-MM-DD
+   [Sogou 摘要，约 60-100 字]
+
+2. [标题] — YYYY-MM-DD
+   [Sogou 摘要，约 60-100 字]
+...
+
+输入编号加载全文，输入 0 重新搜索
+```
+
+4. 用户选择编号后 → 检查缓存 → 进入 [流程 3：读取全文]
+
+**注意**：搜狗结果会混入其他账号，只保留来源为「数字生命卡兹克」的条目。若结果为空，尝试减少关键词。
+
+---
+
+## 流程 3：读取全文
+
+**触发**：用户从流程 1、2 中选择了某篇文章，或粘贴了 URL。
+
+### 第一步：检查缓存
+
+从文章 URL 提取 `mid` 参数（`mid=\d+`），检查 `~/.claude/skills/khazix-reader/cache/{mid}.md` 是否存在：
+
+- **有缓存** → 直接 Read 该文件并输出，**不启动 Playwright**，结束
+- **无缓存** → 继续下方步骤
+
+### 第二步：绕过 CAPTCHA 加载全文
+
+直接访问微信文章 URL 会触发滑块验证码。**优先使用专辑页面方案，搜狗作为最终兜底**：
+
+**方案 A（首选，来自流程 1 的文章）**：文章 URL 来自 `index.yaml`（从专辑页面提取），这类 URL 含有 `chksm` 参数，可直接 `browser_navigate` 打开，无需验证码。
+
+**方案 B（来自流程 2 的文章）**：流程 2 已取得 Sogou 跳转链接，直接用。
+
+**方案 C（用户粘贴的 URL，且本地索引无此文章）**：
+1. 先在 `index.yaml` 里找同名文章 URL（可能含 `chksm`）
+2. 找不到则搜搜狗，取来源为「数字生命卡兹克」且**标题与目标文章相符**的第一条跳转链接（**必须比对标题，防止搜出同名其他文章**）
+
+然后 `browser_navigate` 到目标链接，`browser_evaluate` 提取正文：
+
+```javascript
+() => {
+  const title = document.querySelector('#activity-name')?.innerText?.trim();
+  const date = document.querySelector('#publish_time')?.innerText?.trim();
+  const paras = Array.from(document.querySelectorAll('#js_content p, #js_content section'))
+    .map(el => el.innerText?.trim())
+    .filter(t => t && t.length > 5);
+  return { title, date, content: paras.join('\n\n') };
+}
+```
+
+### 第三步：格式化输出
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+标题：[文章标题]
+日期：[发布日期]
+作者：数字生命卡兹克
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[正文内容，保留段落换行]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+原文链接：[mp.weixin.qq.com URL]
+```
+
+### 第四步：写入缓存
+
+输出完成后，**自动**将正文写入 `~/.claude/skills/khazix-reader/cache/{mid}.md`，无需询问用户。
+
+然后询问：**「是否另存一份到当前工作目录？」**
+- 是 → 保存到当前工作目录，文件名 `{YYYY-MM-DD}-{标题前20字}.md`
+- 否 → 结束
+
+---
+
+## 流程 4：刷新索引
+
+**触发**：用户说「刷新」、「更新索引」、「同步最新文章」。
+
+**步骤**：
+
+对 `index.yaml` 中每个专辑依次执行：
+
+1. `browser_navigate` 打开专辑 URL
+2. `browser_evaluate` 提取文章列表：
+   ```javascript
+   () => {
+     const items = document.querySelectorAll('.js_album_item');
+     return Array.from(items).map(item => ({
+       title: item.getAttribute('data-title'),
+       url: item.getAttribute('data-link')
+     }));
+   }
+   ```
+3. 将结果覆盖写入 `index.yaml` 对应专辑的 `articles`
+
+4. 全部完成后更新 `meta.updated` 为今天日期，并告知用户：
+
+```
+✅ 索引已更新（YYYY-MM-DD）
+共 8 个专辑，N 篇文章
+```
+
+---
+
+## 注意事项
+
+- 微信文章**无需登录**即可访问，但直接访问会触发滑块验证码，必须走搜狗跳转链接
+- 本地关键词匹配用空格分词后逐词匹配，提升命中率（如"code设置"拆为"code"+"设置"分别匹配）
+- 遇到未收录的微信文章 URL，可从页面源码提取 `album_id`（正则 `/album_id=(\d{15,})/`），手动补充到 `index.yaml` 对应专辑
+- 缓存只增不删，如需清空缓存，删除 `cache/` 目录下的 `.md` 文件即可
